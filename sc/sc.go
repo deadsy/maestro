@@ -32,6 +32,10 @@ const cmdStopScript = 0xa4
 const cmdRestartScript = 0xa7
 const cmdRestartScriptParms = 0xa8
 const cmdGetScriptStatus = 0xae
+const cmdSetTargetHighResolution = 0xc0       // jrk motor controller
+const cmdSetTargetLowResolutionReverse = 0xe0 // jrk motor controller
+const cmdSetTargetLowResolutionForward = 0xe1 // jrk motor controller
+const cmdMotorOff = 0xff                      // jrk motor controller
 
 //-----------------------------------------------------------------------------
 
@@ -63,20 +67,43 @@ func GetError(val uint16) error {
 //-----------------------------------------------------------------------------
 // Controller
 
+// Config is the servo controller configuration.
+type Config struct {
+	Port         *serial.Port // serial port to use
+	Name         string       // identifier string
+	DeviceNumber uint8        // device number
+	Compact      bool         // use the compact protocol (single device on serial bus)
+	Crc          bool         // add a crc byte to outgoing commands
+}
+
 // Controller is a servo controller instance.
 type Controller struct {
 	port    *serial.Port // serial port
+	name    string       // identifier string
 	device  uint8        // device number
 	compact bool         // use the compact protocol (single device on serial bus)
+	crc     bool         // add a crc byte to outgoing commands
 }
 
 // NewController returns a new servo motor controller.
-func NewController(port *serial.Port, device uint8, compact bool) *Controller {
-	return &Controller{
-		port:    port,
-		device:  device,
-		compact: compact,
+func NewController(cfg *Config) (*Controller, error) {
+	c := &Controller{
+		port:    cfg.Port,
+		device:  cfg.DeviceNumber,
+		compact: cfg.Compact,
+		crc:     cfg.Crc,
 	}
+	// send a 0xaa for auto baud detection
+	_, err := c.port.Write([]byte{0xaa})
+	if err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+// Close closes the servo controller connection.
+func (c *Controller) Close() error {
+	return c.port.Close()
 }
 
 func (c *Controller) cmdPreamble(command uint8) []byte {
@@ -86,10 +113,34 @@ func (c *Controller) cmdPreamble(command uint8) []byte {
 	return []byte{0xaa, c.device, command & 0x7f}
 }
 
+func (c *Controller) cmdWrite(cmd []byte) error {
+	if c.crc {
+		cmd = append(cmd, crc7(0, cmd)&0x7f)
+	}
+	_, err := c.port.Write(cmd)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *Controller) read(buf []byte) (int, error) {
+	n, err := c.port.Read(buf)
+	if err != nil {
+		return 0, err
+	}
+	if n != len(buf) {
+		return 0, errors.New("short read")
+	}
+	return n, nil
+}
+
 // GetMovingState returns true if any servos are moving.
 func (c *Controller) GetMovingState() (bool, error) {
-	cmd := c.cmdPreamble(cmdGetMovingState)
-	_, err := c.port.Write(cmd)
+	err := c.cmdWrite(c.cmdPreamble(cmdGetMovingState))
+	if err != nil {
+		return false, err
+	}
 	buf := make([]byte, 1)
 	_, err = c.port.Read(buf)
 	if err != nil {
@@ -100,8 +151,10 @@ func (c *Controller) GetMovingState() (bool, error) {
 
 // GetErrors returns the controller error code.
 func (c *Controller) GetErrors() (uint16, error) {
-	cmd := c.cmdPreamble(cmdGetErrors)
-	_, err := c.port.Write(cmd)
+	err := c.cmdWrite(c.cmdPreamble(cmdGetErrors))
+	if err != nil {
+		return 0, err
+	}
 	buf := make([]byte, 2)
 	_, err = c.port.Read(buf)
 	if err != nil {
@@ -112,38 +165,34 @@ func (c *Controller) GetErrors() (uint16, error) {
 
 // GoHome sends all servos to their home position.
 func (c *Controller) GoHome() error {
-	cmd := c.cmdPreamble(cmdGoHome)
-	_, err := c.port.Write(cmd)
-	return err
+	return c.cmdWrite(c.cmdPreamble(cmdGoHome))
 }
 
 // StopScript stops the execution of a servo user script.
 func (c *Controller) StopScript() error {
-	cmd := c.cmdPreamble(cmdStopScript)
-	_, err := c.port.Write(cmd)
-	return err
+	return c.cmdWrite(c.cmdPreamble(cmdStopScript))
 }
 
 // RestartScript restarts the servo script at a specified subroutine.
 func (c *Controller) RestartScript(subroutine uint8) error {
 	cmd := c.cmdPreamble(cmdRestartScript)
 	cmd = append(cmd, subroutine)
-	_, err := c.port.Write(cmd)
-	return err
+	return c.cmdWrite(cmd)
 }
 
 // RestartScriptParms restarts the servo script at a specified subroutine and parameter value.
 func (c *Controller) RestartScriptParms(subroutine uint8, val uint16) error {
 	cmd := c.cmdPreamble(cmdRestartScriptParms)
 	cmd = append(cmd, []byte{subroutine, lo(val), hi(val)}...)
-	_, err := c.port.Write(cmd)
-	return err
+	return c.cmdWrite(cmd)
 }
 
 // GetScriptStatus returns true if a servo script is running.
 func (c *Controller) GetScriptStatus() (bool, error) {
-	cmd := c.cmdPreamble(cmdGetScriptStatus)
-	_, err := c.port.Write(cmd)
+	err := c.cmdWrite(c.cmdPreamble(cmdGetScriptStatus))
+	if err != nil {
+		return false, err
+	}
 	buf := make([]byte, 1)
 	_, err = c.port.Read(buf)
 	if err != nil {
@@ -188,8 +237,7 @@ func (s *Servo) cmdPreamble(command uint8) []byte {
 func (s *Servo) SetTarget(target uint16) error {
 	cmd := s.cmdPreamble(cmdSetTarget)
 	cmd = append(cmd, []byte{lo(target), hi(target)}...)
-	_, err := s.ctrl.port.Write(cmd)
-	return err
+	return s.ctrl.cmdWrite(cmd)
 }
 
 // SetMultipleTargets sets the target value for multiple servos (starting at the referenced servo).
@@ -203,38 +251,36 @@ func (s *Servo) SetMultipleTargets(targets []uint16) error {
 	for _, v := range targets {
 		cmd = append(cmd, []byte{lo(v), hi(v)}...)
 	}
-	_, err := s.ctrl.port.Write(cmd)
-	return err
+	return s.ctrl.cmdWrite(cmd)
 }
 
 // SetSpeed sets the servo maximum speed (0 is no limit).
 func (s *Servo) SetSpeed(speed uint16) error {
 	cmd := s.cmdPreamble(cmdSetSpeed)
 	cmd = append(cmd, []byte{lo(speed), hi(speed)}...)
-	_, err := s.ctrl.port.Write(cmd)
-	return err
+	return s.ctrl.cmdWrite(cmd)
 }
 
 // SetAcceleration sets the servo maximum acceleration (0 is no limit).
 func (s *Servo) SetAcceleration(acceleration uint16) error {
 	cmd := s.cmdPreamble(cmdSetAcceleration)
 	cmd = append(cmd, []byte{lo(acceleration), hi(acceleration)}...)
-	_, err := s.ctrl.port.Write(cmd)
-	return err
+	return s.ctrl.cmdWrite(cmd)
 }
 
 // SetPWM sets the ontime and period for a servo control signal.
 func (s *Servo) SetPWM(ontime, period uint16) error {
 	cmd := s.cmdPreamble(cmdSetPWM)
 	cmd = append(cmd, []byte{lo(ontime), hi(ontime), lo(period), hi(period)}...)
-	_, err := s.ctrl.port.Write(cmd)
-	return err
+	return s.ctrl.cmdWrite(cmd)
 }
 
 // GetPosition returns the current commanded position of a servo.
 func (s *Servo) GetPosition() (uint16, error) {
-	cmd := s.cmdPreamble(cmdGetPosition)
-	_, err := s.ctrl.port.Write(cmd)
+	err := s.ctrl.cmdWrite(s.cmdPreamble(cmdGetPosition))
+	if err != nil {
+		return 0, err
+	}
 	buf := make([]byte, 2)
 	_, err = s.ctrl.port.Read(buf)
 	if err != nil {
