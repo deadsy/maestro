@@ -30,10 +30,10 @@ func sctest() error {
 	if err != nil {
 		return err
 	}
+	defer port.Close()
 
 	scConfig := &sc.Config{
 		Port:         port,
-		Name:         "servo controller",
 		DeviceNumber: 12,
 		Compact:      false,
 		Crc:          true,
@@ -54,24 +54,15 @@ func sctest() error {
 		log.Printf("controller error: %s", err)
 	}
 
-	s0 := sc.NewServo(ctrl, 0)
+	s0 := ctrl.NewServo(0)
+	s0.SetSpeed(0)
+	s0.SetAcceleration(0)
 
-	err = s0.SetTarget(500 * 4)
-	if err != nil {
-		return err
-	}
+	s0.SetTarget(500 * 4)
 	time.Sleep(2 * time.Second)
 
-	err = s0.SetTarget(2500 * 4)
-	if err != nil {
-		return err
-	}
+	s0.SetTarget(2500 * 4)
 	time.Sleep(2 * time.Second)
-
-	err = ctrl.Close()
-	if err != nil {
-		return err
-	}
 
 	return nil
 }

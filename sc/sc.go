@@ -12,13 +12,13 @@ package sc
 
 import (
 	"errors"
+	"io"
 	"strings"
-
-	"github.com/tarm/serial"
 )
 
 //-----------------------------------------------------------------------------
 
+// commands
 const cmdSetTarget = 0x84
 const cmdSetSpeed = 0x87
 const cmdSetAcceleration = 0x89
@@ -36,6 +36,12 @@ const cmdSetTargetHighResolution = 0xc0       // jrk motor controller
 const cmdSetTargetLowResolutionReverse = 0xe0 // jrk motor controller
 const cmdSetTargetLowResolutionForward = 0xe1 // jrk motor controller
 const cmdMotorOff = 0xff                      // jrk motor controller
+
+// position ticks per uSec of servo control pulse
+const uSec = 4
+
+// 14 bits of target position
+const maxTarget = 0x3fff
 
 //-----------------------------------------------------------------------------
 
@@ -69,20 +75,18 @@ func GetError(val uint16) error {
 
 // Config is the servo controller configuration.
 type Config struct {
-	Port         *serial.Port // serial port to use
-	Name         string       // identifier string
-	DeviceNumber uint8        // device number
-	Compact      bool         // use the compact protocol (single device on serial bus)
-	Crc          bool         // add a crc byte to outgoing commands
+	Port         io.ReadWriter // serial port
+	DeviceNumber uint8         // device number
+	Compact      bool          // use the compact protocol (single device on serial bus)
+	Crc          bool          // add a crc byte to outgoing commands
 }
 
 // Controller is a servo controller instance.
 type Controller struct {
-	port    *serial.Port // serial port
-	name    string       // identifier string
-	device  uint8        // device number
-	compact bool         // use the compact protocol (single device on serial bus)
-	crc     bool         // add a crc byte to outgoing commands
+	port    io.ReadWriter // serial port
+	device  uint8         // device number
+	compact bool          // use the compact protocol (single device on serial bus)
+	crc     bool          // add a crc byte to outgoing commands
 }
 
 // NewController returns a new servo motor controller.
@@ -101,11 +105,6 @@ func NewController(cfg *Config) (*Controller, error) {
 	return c, nil
 }
 
-// Close closes the servo controller connection.
-func (c *Controller) Close() error {
-	return c.port.Close()
-}
-
 func (c *Controller) cmdPreamble(command uint8) []byte {
 	if c.compact {
 		return []byte{command}
@@ -113,6 +112,7 @@ func (c *Controller) cmdPreamble(command uint8) []byte {
 	return []byte{0xaa, c.device, command & 0x7f}
 }
 
+// cmdWrite writes a command to the serial port.
 func (c *Controller) cmdWrite(cmd []byte) error {
 	if c.crc {
 		cmd = append(cmd, crc7(0, cmd)&0x7f)
@@ -124,15 +124,16 @@ func (c *Controller) cmdWrite(cmd []byte) error {
 	return nil
 }
 
-func (c *Controller) read(buf []byte) (int, error) {
+// rspRead reads a response from the serial port.
+func (c *Controller) rspRead(buf []byte) error {
 	n, err := c.port.Read(buf)
 	if err != nil {
-		return 0, err
+		return err
 	}
 	if n != len(buf) {
-		return 0, errors.New("short read")
+		return errors.New("short read")
 	}
-	return n, nil
+	return nil
 }
 
 // GetMovingState returns true if any servos are moving.
@@ -141,8 +142,8 @@ func (c *Controller) GetMovingState() (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	buf := make([]byte, 1)
-	_, err = c.port.Read(buf)
+	var buf [1]byte
+	err = c.rspRead(buf[:])
 	if err != nil {
 		return false, err
 	}
@@ -155,8 +156,8 @@ func (c *Controller) GetErrors() (uint16, error) {
 	if err != nil {
 		return 0, err
 	}
-	buf := make([]byte, 2)
-	_, err = c.port.Read(buf)
+	var buf [2]byte
+	err = c.rspRead(buf[:])
 	if err != nil {
 		return 0, err
 	}
@@ -193,8 +194,8 @@ func (c *Controller) GetScriptStatus() (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	buf := make([]byte, 1)
-	_, err = c.port.Read(buf)
+	var buf [1]byte
+	err = c.rspRead(buf[:])
 	if err != nil {
 		return false, err
 	}
@@ -206,15 +207,21 @@ func (c *Controller) GetScriptStatus() (bool, error) {
 
 // Servo is a servo motor instance.
 type Servo struct {
-	ctrl    *Controller
-	channel uint8
+	ctrl    *Controller // parent controller
+	channel uint8       // servo channel number
+	min     uint16      // minimum target position
+	max     uint16      // maximum target position
+	clamp   bool        // clamp out-of-range target values
 }
 
 // NewServo returns a new servo motor instance.
-func NewServo(ctrl *Controller, channel uint8) *Servo {
+func (c *Controller) NewServo(channel uint8) *Servo {
 	return &Servo{
-		ctrl:    ctrl,
+		ctrl:    c,
 		channel: channel,
+		min:     500 * uSec,
+		max:     2500 * uSec,
+		clamp:   false,
 	}
 }
 
@@ -233,8 +240,48 @@ func (s *Servo) cmdPreamble(command uint8) []byte {
 	return []byte{0xaa, s.ctrl.device, command & 0x7f, s.channel}
 }
 
+// checkTarget clamps/limits the servo target value
+func (s *Servo) checkTarget(target uint16) (uint16, error) {
+	if s.clamp {
+		if target < s.min {
+			return s.min, nil
+		}
+		if target > s.max {
+			return s.max, nil
+		}
+	} else {
+		if target < s.min {
+			return s.min, errors.New("target too low")
+		}
+		if target > s.max {
+			return s.max, errors.New("target too high")
+		}
+	}
+	return target, nil
+}
+
+// SetLimits sets the minimum/maximum values for the servo target position.
+func (s *Servo) SetLimits(min, max uint16) error {
+	if max > min {
+		return errors.New("max > min")
+	}
+	if min > maxTarget {
+		return errors.New("min > maxTarget")
+	}
+	if max > maxTarget {
+		return errors.New("max > maxTarget")
+	}
+	s.min = min
+	s.max = max
+	return nil
+}
+
 // SetTarget sets the servo target value.
 func (s *Servo) SetTarget(target uint16) error {
+	target, err := s.checkTarget(target)
+	if err != nil {
+		return err
+	}
 	cmd := s.cmdPreamble(cmdSetTarget)
 	cmd = append(cmd, []byte{lo(target), hi(target)}...)
 	return s.ctrl.cmdWrite(cmd)
@@ -275,14 +322,14 @@ func (s *Servo) SetPWM(ontime, period uint16) error {
 	return s.ctrl.cmdWrite(cmd)
 }
 
-// GetPosition returns the current commanded position of a servo.
+// GetPosition returns the driver's current commanded position for the servo.
 func (s *Servo) GetPosition() (uint16, error) {
 	err := s.ctrl.cmdWrite(s.cmdPreamble(cmdGetPosition))
 	if err != nil {
 		return 0, err
 	}
-	buf := make([]byte, 2)
-	_, err = s.ctrl.port.Read(buf)
+	var buf [2]byte
+	err = s.ctrl.rspRead(buf[:])
 	if err != nil {
 		return 0, err
 	}
