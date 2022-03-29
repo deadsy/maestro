@@ -136,7 +136,8 @@ func (c *Controller) rspRead(buf []byte) error {
 	return nil
 }
 
-// GetMovingState returns true if any servos are moving.
+// GetMovingState returns true if the controller has not reached the target value for all servos.
+// True implies the servos are moving. False does not imply the servos have stopped moving.
 func (c *Controller) GetMovingState() (bool, error) {
 	err := c.cmdWrite(c.cmdPreamble(cmdGetMovingState))
 	if err != nil {
