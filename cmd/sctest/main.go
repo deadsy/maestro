@@ -54,14 +54,22 @@ func sctest() error {
 		log.Printf("controller error: %s", err)
 	}
 
-	s0 := ctrl.NewServo(0)
+	s0, _ := ctrl.NewServo(0)
 	s0.SetSpeed(0)
 	s0.SetAcceleration(0)
 
-	s0.SetTarget(500 * 4)
+	s1, _ := ctrl.NewServo(1)
+	s1.SetSpeed(0)
+	s1.SetAcceleration(0)
+
+	s2, _ := ctrl.NewServo(2)
+	s2.SetSpeed(0)
+	s2.SetAcceleration(0)
+
+	ctrl.SetTargets(0, []uint16{2000, 8000, 2000})
 	time.Sleep(2 * time.Second)
 
-	s0.SetTarget(2500 * 4)
+	ctrl.SetTargets(0, []uint16{8000, 2000, 8000})
 	time.Sleep(2 * time.Second)
 
 	return nil

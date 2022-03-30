@@ -12,6 +12,7 @@ package sc
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 )
@@ -42,6 +43,9 @@ const uSec = 4
 
 // 14 bits of target position
 const maxTarget = 0x3fff
+
+// maximum number of servos per controller
+const maxServos = 24
 
 //-----------------------------------------------------------------------------
 
@@ -83,10 +87,11 @@ type Config struct {
 
 // Controller is a servo controller instance.
 type Controller struct {
-	port    io.ReadWriter // serial port
-	device  uint8         // device number
-	compact bool          // use the compact protocol (single device on serial bus)
-	crc     bool          // add a crc byte to outgoing commands
+	port    io.ReadWriter     // serial port
+	device  uint8             // device number
+	compact bool              // use the compact protocol (single device on serial bus)
+	crc     bool              // add a crc byte to outgoing commands
+	servo   [maxServos]*Servo // child servos
 }
 
 // NewController returns a new servo motor controller.
@@ -203,6 +208,30 @@ func (c *Controller) GetScriptStatus() (bool, error) {
 	return buf[0] == 0, nil
 }
 
+// SetTargets sets the target value for multiple servos (starting at the referenced servo).
+func (c *Controller) SetTargets(channel uint8, targets []uint16) error {
+	if len(targets) == 0 {
+		return nil
+	}
+	// build the command
+	cmd := c.cmdPreamble(cmdSetMultipleTargets)
+	cmd = append(cmd, []byte{byte(len(targets)), channel}...)
+	// check and append the target values
+	for i, v := range targets {
+		ch := channel + uint8(i)
+		if ch >= maxServos || c.servo[ch] == nil {
+			return fmt.Errorf("bad servo channel %d", ch)
+		}
+		val, err := c.servo[ch].checkTarget(v)
+		if err != nil {
+			return fmt.Errorf("%s for channel %d", err.Error(), ch)
+		}
+		cmd = append(cmd, []byte{lo(val), hi(val)}...)
+	}
+	// send the command
+	return c.cmdWrite(cmd)
+}
+
 //-----------------------------------------------------------------------------
 // Servo
 
@@ -216,14 +245,19 @@ type Servo struct {
 }
 
 // NewServo returns a new servo motor instance.
-func (c *Controller) NewServo(channel uint8) *Servo {
-	return &Servo{
+func (c *Controller) NewServo(channel uint8) (*Servo, error) {
+	if channel >= maxServos {
+		return nil, fmt.Errorf("bad servo channel %d", channel)
+	}
+	s := &Servo{
 		ctrl:    c,
 		channel: channel,
 		min:     500 * uSec,
 		max:     2500 * uSec,
 		clamp:   false,
 	}
+	c.servo[channel] = s
+	return s, nil
 }
 
 func lo(x uint16) byte {
@@ -267,10 +301,10 @@ func (s *Servo) SetLimits(min, max uint16) error {
 		return errors.New("max > min")
 	}
 	if min > maxTarget {
-		return errors.New("min > maxTarget")
+		return fmt.Errorf("min > %d", maxTarget)
 	}
 	if max > maxTarget {
-		return errors.New("max > maxTarget")
+		return fmt.Errorf("max > %d", maxTarget)
 	}
 	s.min = min
 	s.max = max
@@ -285,20 +319,6 @@ func (s *Servo) SetTarget(target uint16) error {
 	}
 	cmd := s.cmdPreamble(cmdSetTarget)
 	cmd = append(cmd, []byte{lo(target), hi(target)}...)
-	return s.ctrl.cmdWrite(cmd)
-}
-
-// SetMultipleTargets sets the target value for multiple servos (starting at the referenced servo).
-func (s *Servo) SetMultipleTargets(targets []uint16) error {
-	cmd := make([]byte, 0, 5+2*len(targets))
-	if s.ctrl.compact {
-		cmd = []byte{cmdSetMultipleTargets, byte(len(targets)), s.channel}
-	} else {
-		cmd = []byte{0xaa, s.ctrl.device, cmdSetMultipleTargets & 0x7f, byte(len(targets)), s.channel}
-	}
-	for _, v := range targets {
-		cmd = append(cmd, []byte{lo(v), hi(v)}...)
-	}
 	return s.ctrl.cmdWrite(cmd)
 }
 
@@ -323,7 +343,7 @@ func (s *Servo) SetPWM(ontime, period uint16) error {
 	return s.ctrl.cmdWrite(cmd)
 }
 
-// GetPosition returns the driver's current commanded position for the servo.
+// GetPosition returns the current commanded position for the servo.
 func (s *Servo) GetPosition() (uint16, error) {
 	err := s.ctrl.cmdWrite(s.cmdPreamble(cmdGetPosition))
 	if err != nil {
